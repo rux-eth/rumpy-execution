@@ -1,6 +1,6 @@
 # rumpy-execution
 
-Cost-aware portfolio optimizer and backtester for crypto long/short execution, in Rust. A Clarabel SOCP with transaction costs *inside* the objective — fees, spread, square-root market impact as a power cone, and funding — plus a holdings-based simulation engine, purged walk-forward evaluation, and a battery of probes that independently verify the solver's optimality certificate rather than trusting it.
+Cost-aware portfolio optimizer and backtester for crypto long/short execution, in Rust. A Clarabel SOCP with transaction costs *inside* the objective — fees, spread, square-root market impact as a power cone — plus a holdings-based simulation engine, purged walk-forward evaluation, and a battery of probes that independently verify the solver's optimality certificate rather than trusting it.
 
 ## Where this fits
 
@@ -12,85 +12,67 @@ flowchart LR
     FEAT --> ML["XGBoost alpha models<br/>purged CV (private)"]
     ML -->|"alpha scores<br/>(parquet)"| EXEC
     subgraph PUB["this repo"]
-        EXEC["rumpy-execution<br/>portfolio construction<br/>+ cost model + backtest"]
+        EXEC["rumpy-execution<br/>portfolio construction<br/>+ backtest"]
     end
     EXEC -->|"target weights"| LIVE["live execution runtime<br/>(private, testnet)"]
 ```
 
 ## What it does
 
-Per hourly bar, for an n-asset dollar-neutral book:
+The backtest consumes **one input file** — a unified H1 parquet carrying `close · volume · alpha_future · spread_bps · κ · funding_rate` per (timestamp, symbol) — plus a trial config. Alpha arrives already blended and scored by the private upstream; this crate's job starts at portfolio construction. The strategic loop is **daily**; hourly bars exist as TWAP fill slices.
 
-1. **Preprocess** alpha scores — z-score, multi-horizon persistence blend, winsorize (`preproc.rs`)
-2. **Estimate risk** — EWMA factor covariance Σ = BFB′ + D via randomized PCA: O(N²k) instead of O(N³) per refit (`covariance.rs`)
-3. **Aim portfolio** — the cost-free Markowitz target w_aim = Σ⁻¹α/γ, projected dollar-neutral (`aim.rs`)
-4. **Solve the SOCP** — minimize distance-to-aim plus *realized* trading costs, subject to dollar neutrality, gross-exposure and turnover caps (`solver.rs`)
-5. **Simulate** — bar-by-bar holdings-based engine: dollar positions, cost deduction from cash, weights derived from marked-to-market NAV, exchange fee tiers / hourly funding / margin mechanics (`simulation.rs`, `position.rs`, `exchange.rs`)
-6. **Evaluate** — Sharpe, max drawdown, hit rate, turnover, block-bootstrap CIs, deflated Sharpe; purged walk-forward CV for tuning (`metrics.rs`, `walkforward.rs`)
+1. **Load & precompute** (`backtest.rs`, `preproc.rs`) — validate the parquet (alpha-unit metadata mismatch is a hard failure), intern symbols, dedupe alpha to daily rows, extract the D1 grid *from the same file*. A preproc sidecar then computes — once, cached across tuner trials — the EWMA factor covariance (randomized PCA, O(N²k) per refit), realized vol, ADV, forward returns, and the aim portfolio: w_aim = Σ⁻¹α, projected dollar-neutral, gross rescaled to the leverage target (`covariance.rs`, `aim.rs`).
+2. **Solve — once per day** (`simulation.rs::solve_daily_qp` → `solver.rs`) — the engine hands the solver the *book's* marked-to-market weights as w_prev, applies covariance shrinkage, computes the linear cost c_lin = tiered fee + spread/2 and the impact coefficient κ_eff = κ·σ·(NAV/ADV)^δ per asset, and runs a single Clarabel SOCP solve producing absolute daily target weights.
+3. **Fill** (`simulation.rs`) — per bar, the engine trades a TWAP fraction toward the target (or one daily fill in market mode), scaled down under margin stress, with min-order-size and impact gates deferring trades; tiered fees and realized spread/impact costs are deducted from cash.
+4. **Account** (`position.rs`, `exchange.rs`) — the dollar-denominated book marks to market, accrues hourly funding (actual rates, EWMA model fallback), force-closes stuck positions, and runs the margin check with full liquidation on breach. At each day's last bar it emits the daily record.
+5. **Evaluate** (`walkforward.rs`, `metrics.rs`) — the daily return series is sliced into purged walk-forward folds (per-fold metrics feed tuner objectives), then scored full-series: Sharpe, max drawdown, deflated Sharpe, block-bootstrap CIs.
 
-Three further modules — `gates.rs` (pre-trade hard checks), `universe.rs` (tradable-universe hysteresis), and `ml_cost.rs` (cost-input resolution) — are exported library surface: the private orchestration around this engine wires them in, so they ship here with their tests but have no in-crate caller.
+Several modules ship as **exported library surface with no in-crate caller** — they're wired by the private orchestration around this engine: `gates.rs` (pre-trade hard checks), `universe.rs` (tradable-universe hysteresis), `ml_cost.rs` (cost-input resolution), `alpha.rs`'s z-score/blend implementations (the blend runs upstream; the backtest consumes its output), `io.rs`'s weight writers, `diagnostics.rs`'s per-stage snapshot machinery, and the PyO3 bindings (`python.rs`, feature-gated).
 
 The crate is also the **inner loop of a hyperparameter search**: the private Python side runs Optuna over execution parameters, calling this engine (natively or via the PyO3 bindings) as the objective function. That pressure shaped the design — the preproc sidecar exists so derived lookups are computed once and cached across trials rather than rebuilt per trial, and `walkforward.rs` aggregates purged per-fold metrics directly into tuner objectives. It's why this layer is in Rust in the first place: the backtest has to be cheap enough to run thousands of times.
 
-The QP has 6n variables — weights plus auxiliaries for turnover `|Δw|`, gross exposure `|w|`, and the impact cone `t ≥ |Δw|^1.5` encoded as a PowerCone(2/3). Market impact enters the objective as κ·t, so the optimizer minimizes the **realized** cost function itself, not a linearization of it.
+## The optimization problem
+
+The QP's base layout is 6n variables — `x = [w, u, t, t_imp, y, s]`: weights, turnover auxiliaries `u ≥ |Δw|`, gross-exposure auxiliaries `t ≥ |w|`, impact-cone slacks `t_imp ≥ u^1.5` encoded as PowerCone(2/3), the cone's unit third coordinates `y`, and ReLU residuals `s` — plus optional blocks when the SOC vol-target or top-k features are enabled. The objective is
+
+```
+min  −α′w + γ·w′Σw + λ_aim·‖w − w_aim‖² + c_lin′u + Σ s
+     s.t.  Σw = 0 (dollar-neutral) · Σt ≤ L_max (gross cap) · per-name caps
+           s_i ≥ κ_eff·t_imp,i − r_i·u_i  (impact above the free allowance r)
+```
+
+so the solver prices the **realized** impact-cost curve rather than a linearization of it (with `r = 0` this reduces to a pure κ·t_imp cone objective — the two formulations are compared quantitatively by `probe_qref`). Turnover is priced through `c_lin′u`, not capped. There is no fallback solver: a failed solve carries the previous target forward.
 
 ## Inside the crate
 
-How a backtest actually moves through the modules, top to bottom — solid arrows are the data path, the dashed arrow is the feedback loop that makes the simulation holdings-based rather than open-loop. (`config.rs` feeds every stage and `diagnostics.rs` snapshots after every stage; those edges are omitted to keep the flow readable. `gates.rs` / `universe.rs` / `ml_cost.rs` / `python.rs` are exported surface with no in-crate caller — see the component map.)
+How a backtest actually moves through the modules — solid arrows are the data path, the dashed arrow is the feedback loop that makes the simulation holdings-based rather than open-loop:
 
 ```mermaid
 flowchart TB
-    subgraph IN["Inputs"]
-        direction LR
-        H1["unified H1 parquet<br/>close · volume · alpha_future<br/>spread_bps · κ · funding_rate"]
-        D1["D1 OHLCV parquet"]
-        YAML["config YAML"]
-    end
-
-    LOAD["backtest.rs entry — io.rs + config.rs<br/>parquet load · schema validation · typed run config"]
-    PRE["preproc.rs — sidecar<br/>derived lookups, computed once, cached across tuner trials"]
+    H1["unified H1 parquet — the only data input<br/>close · volume · alpha_future · spread_bps · κ · funding_rate"]
+    CFG["trial config"]
+    LOAD["backtest.rs — PreloadedData::load<br/>schema + alpha-unit validation · symbol interning ·<br/>daily alpha dedup · D1 grid from the same file"]
+    PRE["preproc.rs — sidecar, computed once, cached across tuner trials<br/>EWMA factor covariance (covariance.rs, randomized PCA) ·<br/>σ · ADV · forward returns · aim weights (aim.rs: Σ⁻¹α → dollar-neutral → l_target)"]
 
     H1 --> LOAD
-    D1 --> LOAD
-    YAML --> LOAD
+    CFG --> LOAD
     LOAD --> PRE
 
-    subgraph RISK["Risk & target"]
-        direction LR
-        ALPHA["alpha.rs<br/>z-score · blend · winsorize"]
-        COV["covariance.rs<br/>EWMA Σ = BFB′ + D<br/>randomized PCA, O(N²k)"]
-    end
-
-    AIM["aim.rs<br/>w_aim = Σ⁻¹α/γ (Cholesky) · dollar-neutral projection"]
-
-    PRE --> ALPHA
-    PRE --> COV
-    ALPHA --> AIM
-    COV --> AIM
-
-    subgraph SIM["simulation.rs — per-bar engine"]
-        COST["cost.rs<br/>c_lin = fee + spread/2<br/>κ_eff = κ·σ·(NAV/ADV)^δ<br/>AR(1) funding expectation"]
-        SOL["solver.rs<br/>Clarabel SOCP — 6n vars<br/>PowerCone(2/3) impact<br/>(OSQP QP fallback)"]
-        EXCH["exchange.rs<br/>volume-tiered fees<br/>hourly funding · cross-margin"]
+    subgraph SIM["simulation.rs — bar loop"]
+        MTM["mark book to market ·<br/>accrue funding (exchange.rs rates, cost.rs FundingModel fallback)"]
+        QP["solve_daily_qp — once per day<br/>w_prev = book weights · covariance shrinkage ·<br/>c_lin = tiered fee + spread/2 · κ_eff = κ·σ·(NAV/ADV)^δ ·<br/>Clarabel SOCP (solver.rs) → absolute daily target"]
+        FILL["TWAP slices toward target<br/>margin-stress scaling · min-order + impact gates ·<br/>fees / spread / impact deducted from cash"]
         BOOK["position.rs — dollar holdings book<br/>w = h / NAV, marked to market"]
-        COST --> SOL
-        SOL -->|"target Δw"| BOOK
-        EXCH -->|"fees · funding · margin"| BOOK
-        BOOK -.->|"next bar: w_prev from<br/>marked-to-market holdings"| SOL
+        RISK["margin check → liquidation (exchange.rs) ·<br/>day-end record · fold-boundary NAV reset"]
+        MTM --> QP --> FILL --> BOOK --> RISK
+        BOOK -.->|"next day: w_prev from<br/>marked-to-market holdings"| QP
     end
 
-    AIM --> SOL
+    PRE --> MTM
 
-    subgraph EVAL["Evaluation & outputs"]
-        direction LR
-        MET["metrics.rs<br/>Sharpe · MDD · deflated Sharpe<br/>block-bootstrap CI"]
-        WF["walkforward.rs<br/>purged CV folds"]
-        W["weights_final.parquet<br/>weights_qp_raw.parquet"]
-    end
+    EVAL["evaluation — walkforward.rs purged folds (tuner objectives)<br/>then metrics.rs full-series: Sharpe · MDD · deflated Sharpe · bootstrap CI"]
 
-    BOOK -->|"per-bar returns"| MET
-    MET --> WF
-    BOOK --> W
+    RISK -->|"daily return series"| EVAL
 ```
 
 The dashed `w_prev` edge is the crate's core design commitment: the optimizer's next input comes from the *book* — real dollar holdings marked to market — never from its own previous output.
@@ -117,20 +99,20 @@ cargo run --release --example cross_platform_check   # run on two machines, diff
 
 | Path | Responsibility | Tests |
 |---|---|---|
-| `src/solver.rs` | Clarabel SOCP formulation (6n vars, power-cone impact); OSQP QP fallback | 9 |
-| `src/simulation.rs` | Holdings-based bar-by-bar engine — the reference execution loop | 44 |
+| `src/solver.rs` | Clarabel SOCP formulation — 6n base variables, power-cone impact, optional vol-target/top-k blocks | 9 |
+| `src/simulation.rs` | The engine: bar loop, daily QP solve (cost coefficients computed here), TWAP fills, margin stress — the reference execution loop | 44 |
 | `src/position.rs` | Dollar-denominated position book; weights derived from marked-to-market NAV | 13 |
-| `src/exchange.rs` | Fee tiers (14-day trailing volume), hourly funding, cross-margin mechanics | 38 |
-| `src/cost.rs` | Cost primitives: EWMA ADV, realized vol, linear + sqrt-impact coefficients, AR(1) closed-form expected funding (Koijen et al. 2018 carry framework) | 12 |
-| `src/ml_cost.rs` | Cost-input resolution: L2 book-walk data when available → ML-predicted spread/κ from parquet → hard error (never a silent fallback) | 7 |
+| `src/exchange.rs` | Fee tiers (14-day trailing volume), hourly funding, cross-margin mechanics, liquidation | 38 |
+| `src/cost.rs` | `FundingModel` — AR(1) closed-form expected funding (Koijen et al. 2018 carry framework) — plus cost-primitive reference implementations (exported) | 12 |
+| `src/ml_cost.rs` | Cost-input resolution: L2 book-walk data → ML-predicted spread/κ from parquet → hard error, never a silent fallback (exported surface) | 7 |
 | `src/covariance.rs` | EWMA factor covariance with randomized PCA; factor-form storage, on-demand submatrix reconstruction | 3 |
-| `src/aim.rs` | Cost-free Markowitz aim portfolio (Cholesky), dollar-neutral projection | 2 |
-| `src/backtest.rs` | Backtest entry point over a unified H1 parquet; dhat heap profiling behind a feature flag | 7 |
-| `src/walkforward.rs` | Purged walk-forward CV — purging guards the w_prev state chain across fold boundaries; aggregates fold metrics into Optuna objectives | 3 |
+| `src/aim.rs` | Aim portfolio Σ⁻¹α (ridge-regularized Cholesky), dollar-neutral projection, gross rescale to leverage target | 2 |
+| `src/backtest.rs` | Backtest entry point over the unified H1 parquet; preload/rebuild provenance; dhat heap profiling behind a feature flag | 7 |
+| `src/walkforward.rs` | Purged walk-forward CV — excluded return-windows between folds guard the persistent w_prev chain; aggregates fold metrics into Optuna objectives | 3 |
 | `src/metrics.rs` | Pure-math return-series metrics incl. deflated Sharpe and block-bootstrap CIs | 17 |
-| `src/gates.rs` | Pre-trade hard checks (defer, don't reject) | 9 |
-| `src/universe.rs` | Tradable-universe hysteresis state machine (Excluded → Active → ExitOnly) | 9 |
-| `src/diagnostics.rs` | Per-stage state capture so a wrong number is traceable to the exact stage that produced it | — |
+| `src/gates.rs` | Pre-trade hard checks (defer, don't reject) — exported surface | 9 |
+| `src/universe.rs` | Tradable-universe hysteresis state machine (Excluded → Active → ExitOnly) — exported surface | 9 |
+| `src/alpha.rs`, `src/io.rs`, `src/diagnostics.rs` | Upstream z-score/blend reference, parquet weight I/O, per-stage snapshot machinery — exported surface; the in-crate path uses only fragments (e.g. date helpers) | 5 |
 | `src/python.rs` | Optional PyO3 bindings (`--features python`) for the Python research side | — |
 
 ## Key design decisions
@@ -139,11 +121,11 @@ cargo run --release --example cross_platform_check   # run on two machines, diff
 
 2. **Holdings in dollars, weights derived.** The simulation tracks actual dollar positions and marks to market; the optimizer receives weights derived from real NAV, not its own previous output (Boyd et al. 2017, cvxportfolio). A weight-only chain compounds drift between what the optimizer believes and what the book holds. *Rejected: the weight-only pipeline this engine replaced.*
 
-3. **Costs inside the objective, not applied after.** Impact enters as a power cone so the solver trades expected alpha against the true cost curve; funding is subtracted from alpha pre-optimization as an AR(1) closed-form expectation. Optimizing cost-blind and deducting afterwards systematically overtrades. *Rejected: optimize-then-deduct.*
+3. **Costs inside the objective, not applied after.** Linear costs price turnover directly (c_lin′u) and impact enters through the power cone — with a ReLU residual formulation that charges impact only above a free allowance, chosen after `probe_qref` quantified the difference. Optimizing cost-blind and deducting afterwards systematically overtrades. Funding is always *accrued* in the PnL; feeding the AR(1) expected-funding model into alpha pre-optimization exists as an opt-in config flag, off by default. *Rejected: optimize-then-deduct.*
 
-4. **Hard errors over silent fallbacks in the cost chain.** A missing ML cost prediction is a data-pipeline failure and raises; it does not fall back to a tier average that would silently mis-price a fill. *Rejected: permissive defaults.*
+4. **Hard errors over silent fallbacks in the cost chain.** In the strict production mode, a missing ML cost prediction is a data-pipeline failure and raises; it does not fall back to a tier average that would silently mis-price a fill. The same posture at load time: an alpha-unit metadata mismatch refuses to run. *Rejected: permissive defaults.*
 
-5. **Evaluation that resists self-deception.** Walk-forward folds are purged so the w_prev state chain can't leak across boundaries; headline numbers ship with deflated Sharpe (multiple-testing-aware) and block-bootstrap confidence intervals rather than a naive point Sharpe. *Rejected: overlapping-window Sharpe as the objective.*
+5. **Evaluation that resists self-deception.** Walk-forward folds exclude return-windows between evaluation windows so the persistent w_prev state chain can't leak across fold boundaries; headline numbers ship with deflated Sharpe (multiple-testing-aware) and block-bootstrap confidence intervals rather than a naive point Sharpe. *Rejected: overlapping-window Sharpe as the objective.*
 
 ## Testing
 
@@ -157,7 +139,7 @@ cargo build --release --examples
 ## Status — honest scope
 
 - This is the research/backtest execution layer of a private system. **It does not trade live** — the live runtime is a separate private service, and it runs testnet.
-- Inputs (alpha scores, OHLCV, funding, cost predictions) arrive as parquet with a documented schema (`io.rs`, `backtest.rs`); no data or trained models are included.
+- Inputs (alpha scores, prices, spreads, impact coefficients, funding) arrive in a single parquet with a documented schema (`backtest.rs`); no data or trained models are included.
 - The exchange model defaults to Hyperliquid perpetual mechanics (public fee/margin parameters); it's a config struct, deliberately not yet a trait — one exchange doesn't justify the abstraction.
 - Extracted from the parent monorepo 2026-08; fresh history from that point.
 
