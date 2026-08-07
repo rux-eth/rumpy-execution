@@ -25,11 +25,87 @@ Per hourly bar, for an n-asset dollar-neutral book:
 2. **Estimate risk** — EWMA factor covariance Σ = BFB′ + D via randomized PCA: O(N²k) instead of O(N³) per refit (`covariance.rs`)
 3. **Aim portfolio** — the cost-free Markowitz target w_aim = Σ⁻¹α/γ, projected dollar-neutral (`aim.rs`)
 4. **Solve the SOCP** — minimize distance-to-aim plus *realized* trading costs, subject to dollar neutrality, gross-exposure and turnover caps (`solver.rs`)
-5. **Gate** — pre-trade hard checks per asset per slice; failure defers, never permanently rejects (`gates.rs`)
-6. **Simulate** — bar-by-bar holdings-based engine: dollar positions, cost deduction from cash, weights derived from marked-to-market NAV, exchange fee tiers / hourly funding / margin mechanics (`simulation.rs`, `position.rs`, `exchange.rs`)
-7. **Evaluate** — Sharpe, max drawdown, hit rate, turnover, block-bootstrap CIs, deflated Sharpe; purged walk-forward CV for tuning (`metrics.rs`, `walkforward.rs`)
+5. **Simulate** — bar-by-bar holdings-based engine: dollar positions, cost deduction from cash, weights derived from marked-to-market NAV, exchange fee tiers / hourly funding / margin mechanics (`simulation.rs`, `position.rs`, `exchange.rs`)
+6. **Evaluate** — Sharpe, max drawdown, hit rate, turnover, block-bootstrap CIs, deflated Sharpe; purged walk-forward CV for tuning (`metrics.rs`, `walkforward.rs`)
+
+Three further modules — `gates.rs` (pre-trade hard checks), `universe.rs` (tradable-universe hysteresis), and `ml_cost.rs` (cost-input resolution) — are exported library surface: the private orchestration around this engine wires them in, so they ship here with their tests but have no in-crate caller.
 
 The QP has 6n variables — weights plus auxiliaries for turnover `|Δw|`, gross exposure `|w|`, and the impact cone `t ≥ |Δw|^1.5` encoded as a PowerCone(2/3). Market impact enters the objective as κ·t, so the optimizer minimizes the **realized** cost function itself, not a linearization of it.
+
+## Inside the crate
+
+How a backtest actually moves through the modules — solid arrows are the data path, the dashed arrow is the feedback loop that makes the simulation holdings-based rather than open-loop:
+
+```mermaid
+flowchart TD
+    subgraph IN["Inputs"]
+        H1["unified H1 parquet<br/>close · volume · alpha_future<br/>spread_bps · κ · funding_rate"]
+        D1["D1 OHLCV parquet"]
+        YAML["config YAML"]
+    end
+
+    subgraph BT["backtest.rs — entry point"]
+        IO["io.rs<br/>parquet load + schema validation"]
+        CFG["config.rs<br/>typed run config"]
+        PRE["preproc.rs — sidecar<br/>derived lookups, computed once,<br/>cached across tuner trials"]
+    end
+
+    subgraph RISK["Risk & target"]
+        COV["covariance.rs<br/>EWMA Σ = BFB′ + D<br/>randomized PCA, O(N²k)"]
+        AIM["aim.rs<br/>w_aim = Σ⁻¹α/γ (Cholesky)<br/>dollar-neutral projection"]
+        ALPHA["alpha.rs<br/>z-score · blend · winsorize"]
+    end
+
+    subgraph SIM["simulation.rs — per-bar engine"]
+        LOOP["bar loop"]
+        COST["cost.rs<br/>c_lin = fee + spread/2<br/>κ_eff = κ·σ·(NAV/ADV)^δ<br/>AR(1) funding expectation"]
+        SOL["solver.rs<br/>Clarabel SOCP — 6n vars<br/>PowerCone(2/3) impact<br/>(OSQP QP fallback)"]
+        BOOK["position.rs<br/>dollar holdings book<br/>w = h / NAV, marked to market"]
+        EXCH["exchange.rs<br/>volume-tiered fees<br/>hourly funding · cross-margin"]
+    end
+
+    subgraph EVAL["Evaluation"]
+        MET["metrics.rs<br/>Sharpe · MDD · deflated Sharpe<br/>block-bootstrap CI"]
+        WF["walkforward.rs<br/>purged CV folds"]
+    end
+
+    subgraph OUT["Outputs"]
+        W["weights_final.parquet<br/>weights_qp_raw.parquet"]
+        DIAG["diagnostics.rs<br/>per-stage state capture"]
+    end
+
+    subgraph LIB["Exported surface — wired by the private callers"]
+        GATES["gates.rs<br/>pre-trade hard checks<br/>(defer, never reject)"]
+        UNI["universe.rs<br/>hysteresis state machine<br/>Excluded → Active → ExitOnly"]
+        MLC["ml_cost.rs<br/>cost-input resolution<br/>L2 book-walk → ML parquet → error"]
+        PY["python.rs<br/>PyO3 bindings (feature-gated)"]
+    end
+
+    H1 --> IO
+    D1 --> IO
+    YAML --> CFG
+    IO --> PRE
+    CFG --> PRE
+    PRE --> COV
+    PRE --> ALPHA
+    COV --> AIM
+    ALPHA --> AIM
+    AIM --> LOOP
+    COV --> LOOP
+    CFG --> SOL
+    COST --> SOL
+    LOOP --> SOL
+    SOL -->|"target Δw"| BOOK
+    EXCH -->|"fees · funding · margin"| BOOK
+    BOOK -.->|"marked-to-market w_prev<br/>(holdings feedback)"| LOOP
+    LOOP -->|"per-bar returns"| MET
+    MET --> WF
+    LOOP --> W
+    BT -.-> DIAG
+    SIM -.-> DIAG
+```
+
+The dashed `w_prev` edge is the crate's core design commitment: the optimizer's next input comes from the *book* — real dollar holdings marked to market — never from its own previous output.
 
 ## Numerical-correctness probes
 
