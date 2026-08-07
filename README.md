@@ -34,75 +34,61 @@ The QP has 6n variables — weights plus auxiliaries for turnover `|Δw|`, gross
 
 ## Inside the crate
 
-How a backtest actually moves through the modules — solid arrows are the data path, the dashed arrow is the feedback loop that makes the simulation holdings-based rather than open-loop:
+How a backtest actually moves through the modules, top to bottom — solid arrows are the data path, the dashed arrow is the feedback loop that makes the simulation holdings-based rather than open-loop. (`config.rs` feeds every stage and `diagnostics.rs` snapshots after every stage; those edges are omitted to keep the flow readable. `gates.rs` / `universe.rs` / `ml_cost.rs` / `python.rs` are exported surface with no in-crate caller — see the component map.)
 
 ```mermaid
-flowchart TD
+flowchart TB
     subgraph IN["Inputs"]
+        direction LR
         H1["unified H1 parquet<br/>close · volume · alpha_future<br/>spread_bps · κ · funding_rate"]
         D1["D1 OHLCV parquet"]
         YAML["config YAML"]
     end
 
-    subgraph BT["backtest.rs — entry point"]
-        IO["io.rs<br/>parquet load + schema validation"]
-        CFG["config.rs<br/>typed run config"]
-        PRE["preproc.rs — sidecar<br/>derived lookups, computed once,<br/>cached across tuner trials"]
-    end
+    LOAD["backtest.rs entry — io.rs + config.rs<br/>parquet load · schema validation · typed run config"]
+    PRE["preproc.rs — sidecar<br/>derived lookups, computed once, cached across tuner trials"]
+
+    H1 --> LOAD
+    D1 --> LOAD
+    YAML --> LOAD
+    LOAD --> PRE
 
     subgraph RISK["Risk & target"]
-        COV["covariance.rs<br/>EWMA Σ = BFB′ + D<br/>randomized PCA, O(N²k)"]
-        AIM["aim.rs<br/>w_aim = Σ⁻¹α/γ (Cholesky)<br/>dollar-neutral projection"]
+        direction LR
         ALPHA["alpha.rs<br/>z-score · blend · winsorize"]
+        COV["covariance.rs<br/>EWMA Σ = BFB′ + D<br/>randomized PCA, O(N²k)"]
     end
+
+    AIM["aim.rs<br/>w_aim = Σ⁻¹α/γ (Cholesky) · dollar-neutral projection"]
+
+    PRE --> ALPHA
+    PRE --> COV
+    ALPHA --> AIM
+    COV --> AIM
 
     subgraph SIM["simulation.rs — per-bar engine"]
-        LOOP["bar loop"]
         COST["cost.rs<br/>c_lin = fee + spread/2<br/>κ_eff = κ·σ·(NAV/ADV)^δ<br/>AR(1) funding expectation"]
         SOL["solver.rs<br/>Clarabel SOCP — 6n vars<br/>PowerCone(2/3) impact<br/>(OSQP QP fallback)"]
-        BOOK["position.rs<br/>dollar holdings book<br/>w = h / NAV, marked to market"]
         EXCH["exchange.rs<br/>volume-tiered fees<br/>hourly funding · cross-margin"]
+        BOOK["position.rs — dollar holdings book<br/>w = h / NAV, marked to market"]
+        COST --> SOL
+        SOL -->|"target Δw"| BOOK
+        EXCH -->|"fees · funding · margin"| BOOK
+        BOOK -.->|"next bar: w_prev from<br/>marked-to-market holdings"| SOL
     end
 
-    subgraph EVAL["Evaluation"]
+    AIM --> SOL
+
+    subgraph EVAL["Evaluation & outputs"]
+        direction LR
         MET["metrics.rs<br/>Sharpe · MDD · deflated Sharpe<br/>block-bootstrap CI"]
         WF["walkforward.rs<br/>purged CV folds"]
-    end
-
-    subgraph OUT["Outputs"]
         W["weights_final.parquet<br/>weights_qp_raw.parquet"]
-        DIAG["diagnostics.rs<br/>per-stage state capture"]
     end
 
-    subgraph LIB["Exported surface — wired by the private callers"]
-        GATES["gates.rs<br/>pre-trade hard checks<br/>(defer, never reject)"]
-        UNI["universe.rs<br/>hysteresis state machine<br/>Excluded → Active → ExitOnly"]
-        MLC["ml_cost.rs<br/>cost-input resolution<br/>L2 book-walk → ML parquet → error"]
-        PY["python.rs<br/>PyO3 bindings (feature-gated)"]
-    end
-
-    H1 --> IO
-    D1 --> IO
-    YAML --> CFG
-    IO --> PRE
-    CFG --> PRE
-    PRE --> COV
-    PRE --> ALPHA
-    COV --> AIM
-    ALPHA --> AIM
-    AIM --> LOOP
-    COV --> LOOP
-    CFG --> SOL
-    COST --> SOL
-    LOOP --> SOL
-    SOL -->|"target Δw"| BOOK
-    EXCH -->|"fees · funding · margin"| BOOK
-    BOOK -.->|"marked-to-market w_prev<br/>(holdings feedback)"| LOOP
-    LOOP -->|"per-bar returns"| MET
+    BOOK -->|"per-bar returns"| MET
     MET --> WF
-    LOOP --> W
-    BT -.-> DIAG
-    SIM -.-> DIAG
+    BOOK --> W
 ```
 
 The dashed `w_prev` edge is the crate's core design commitment: the optimizer's next input comes from the *book* — real dollar holdings marked to market — never from its own previous output.
