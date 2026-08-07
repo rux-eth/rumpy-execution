@@ -30,6 +30,8 @@ Per hourly bar, for an n-asset dollar-neutral book:
 
 Three further modules — `gates.rs` (pre-trade hard checks), `universe.rs` (tradable-universe hysteresis), and `ml_cost.rs` (cost-input resolution) — are exported library surface: the private orchestration around this engine wires them in, so they ship here with their tests but have no in-crate caller.
 
+The crate is also the **inner loop of a hyperparameter search**: the private Python side runs Optuna over execution parameters, calling this engine (natively or via the PyO3 bindings) as the objective function. That pressure shaped the design — the preproc sidecar exists so derived lookups are computed once and cached across trials rather than rebuilt per trial, and `walkforward.rs` aggregates purged per-fold metrics directly into tuner objectives. It's why this layer is in Rust in the first place: the backtest has to be cheap enough to run thousands of times.
+
 The QP has 6n variables — weights plus auxiliaries for turnover `|Δw|`, gross exposure `|w|`, and the impact cone `t ≥ |Δw|^1.5` encoded as a PowerCone(2/3). Market impact enters the objective as κ·t, so the optimizer minimizes the **realized** cost function itself, not a linearization of it.
 
 ## Inside the crate
@@ -124,7 +126,7 @@ cargo run --release --example cross_platform_check   # run on two machines, diff
 | `src/covariance.rs` | EWMA factor covariance with randomized PCA; factor-form storage, on-demand submatrix reconstruction | 3 |
 | `src/aim.rs` | Cost-free Markowitz aim portfolio (Cholesky), dollar-neutral projection | 2 |
 | `src/backtest.rs` | Backtest entry point over a unified H1 parquet; dhat heap profiling behind a feature flag | 7 |
-| `src/walkforward.rs` | Purged walk-forward CV — purging guards the w_prev state chain across fold boundaries | 3 |
+| `src/walkforward.rs` | Purged walk-forward CV — purging guards the w_prev state chain across fold boundaries; aggregates fold metrics into Optuna objectives | 3 |
 | `src/metrics.rs` | Pure-math return-series metrics incl. deflated Sharpe and block-bootstrap CIs | 17 |
 | `src/gates.rs` | Pre-trade hard checks (defer, don't reject) | 9 |
 | `src/universe.rs` | Tradable-universe hysteresis state machine (Excluded → Active → ExitOnly) | 9 |
