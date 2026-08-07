@@ -1074,16 +1074,6 @@ impl<'a> SimulationEngine<'a> {
     // Internal helpers
     // -----------------------------------------------------------------------
 
-    fn group_by_timestamp(alphas: &[AlphaRow]) -> Vec<(i64, Vec<(&str, f64)>)> {
-        let mut map: HashMap<i64, Vec<(&str, f64)>> = HashMap::new();
-        for row in alphas {
-            map.entry(row.timestamp).or_default().push((&row.symbol, row.alpha_future));
-        }
-        let mut pairs: Vec<_> = map.into_iter().collect();
-        pairs.sort_by_key(|(ts, _)| *ts);
-        pairs
-    }
-
     fn solve_daily_qp(
         &mut self,
         ts: i64,

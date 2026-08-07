@@ -11,7 +11,6 @@
 //!   - Boyd et al. (2017) for the factor covariance QP formulation
 
 use std::collections::HashMap;
-use std::io::{Read, Write};
 
 // ---------------------------------------------------------------------------
 // Factor model storage (replaces full N×N per timestamp)
