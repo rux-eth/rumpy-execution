@@ -1,0 +1,57 @@
+[package]
+name = "rumpy-execution"
+version = "0.1.0"
+edition = "2021"
+description = "QP-based portfolio optimizer for crypto L/S execution"
+
+[dependencies]
+# Workspace deps
+arrow = { version = "54", features = ["prettyprint"] }
+parquet = { version = "54", features = ["arrow"] }
+serde = { version = "1", features = ["derive"] }
+serde_yaml = "0.9"
+anyhow = "1"
+tracing = "0.1"
+
+# Linear algebra
+faer = "0.20"
+
+# QP solvers
+clarabel = "0.11"
+osqp = "1.0"
+
+# Numerics
+num-traits = "0.2"
+
+# Statistics (normal CDF for deflated Sharpe)
+statrs = "0.18"
+
+# PRNG (block bootstrap CI)
+rand = "0.9"
+
+# Cost-model artifact lineage SHA-256 validation (Phase 1, 2026-05-18).
+sha2 = "0.10"
+
+[features]
+python = ["pyo3/extension-module", "numpy"]
+heap-profile = ["dep:dhat"]
+
+[dependencies.dhat]
+version = "0.3"
+optional = true
+
+[dependencies.pyo3]
+version = "0.24"
+optional = true
+
+[dependencies.numpy]
+version = "0.24"
+optional = true
+
+[dev-dependencies]
+approx = "0.5"
+serde_json = "1"
+
+[lib]
+name = "rumpy_execution"
+crate-type = ["lib", "cdylib"]
